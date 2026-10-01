@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robochitu"
+version = "1.0.0"
+description = "Robô de automação do CHITUBOX (fatiamento STL/CHITUBOX)"
+requires-python = ">=3.10"
+dependencies = [
+    "pyautogui>=0.9.54",
+    "pyscreeze>=1.0.1",
+    "pillow>=12.3.0",
+    "opencv-python>=5.0.0",
+    "rapidocr>=3.9.2",
+    "onnxruntime>=1.30.0",
+    "pandas>=3.0.6",
+    "openpyxl>=3.1.5",
+]
+
+[project.scripts]
+robo = "automatizar_chitubox:iniciar_robo"
+
+[tool.setuptools]
+py-modules = ["automatizar_chitubox"]
+
+
+##python.exe -m pip install -e .
+

@@ -29,6 +29,10 @@ TABELA_TEMPOS = [   # (máximo de ficheiros, segundos)
     (14, 150), (18, 180),
 ]
 TEMPO_PADRAO = 210   # acima de 18 ficheiros
+# Depois da espera mínima, lê o ecrã repetidamente até o Weight/Time aparecer (sem 'Calculating...')
+INTERVALO_LEITURA = 10          # segundos entre leituras
+FATOR_LIMITE_ESPERA = 4         # limite = tempo mínimo × este fator...
+LIMITE_MINIMO_ESPERA = 600      # ...mas nunca menos que isto (segundos)
 
 
 def tem_extensao_valida(nome_ficheiro):
@@ -51,6 +55,12 @@ def tempo_espera_por_quantidade(quantidade):
 
 # Imagens de referência
 IMG_BOTAO_VOLTAR = os.path.join(PASTA_BASE, "botao_voltar.png")
+IMG_SLICE_CURRENT = os.path.join(PASTA_BASE, "botao_current_platform.png")  # dropdown fechado no painel Slice
+IMG_SLICE_ALL = os.path.join(PASTA_BASE, "botao_all_platform.png")          # opção 'All Platform' da lista
+IMG_COUNT = os.path.join(PASTA_BASE, "count.png")  # caixa 'Count' (valor 5) do painel Add Platform
+
+# True: abre com o 1.º ficheiro e importa os restantes da pasta (Ctrl+O) antes do fluxo de All Platform
+IMPORTAR_RESTANTES = True
 
 pyautogui.FAILSAFE = True
 
@@ -72,6 +82,83 @@ def executar_fatiamento_teclado():
     time.sleep(3) 
     print("A confirmar o fatiamento (Enter)...")
     pyautogui.press('enter')
+
+def localizar_na_tela(imagem, tentativas=5, intervalo=1, confidence=0.8):
+    """Devolve o centro de 'imagem' no ecrã, ou None."""
+    for _ in range(tentativas):
+        try:
+            centro = pyautogui.locateCenterOnScreen(imagem, confidence=confidence)
+            if centro:
+                return centro
+        except pyautogui.ImageNotFoundException:
+            pass
+        time.sleep(intervalo)
+    return None
+
+def adicionar_plataforma_por_atalho():
+    """Adiciona a 2.ª plataforma: A, P abre o painel Add Platform; clica no 5 da caixa Count,
+    escreve 1 e Enter (Apply)."""
+    print("A adicionar a 2.ª plataforma (A -> P -> Count 1 -> Enter)...")
+    trazer_chitubox_para_frente()
+    pyautogui.press('a')
+    time.sleep(0.5)
+    pyautogui.press('p')
+    time.sleep(2)
+
+    centro = localizar_na_tela(IMG_COUNT, tentativas=5, confidence=0.8)
+    if not centro:
+        caminho_debug = os.path.join(PASTA_BASE, "debug_add_platform.png")
+        pyautogui.screenshot().save(caminho_debug)
+        print(f"❌ Painel 'Count' não encontrado. Captura de debug: {caminho_debug}")
+        pyautogui.press('esc')
+        return False
+
+    # count.png é só o rótulo 'Count' (50x30); o '5' fica 44 px à direita do centro do rótulo
+    pyautogui.click(centro.x + 44, centro.y)
+    time.sleep(0.5)
+    pyautogui.hotkey('ctrl', 'a')   # apaga o 5 selecionado antes de escrever
+    pyautogui.write('1', interval=0.05)
+    time.sleep(0.5)
+    pyautogui.press('enter')        # Apply
+    pyautogui.press('enter')        # Apply
+    time.sleep(2)
+
+    # afasta o rato da zona dos botões para nenhum tooltip tapar o ecrã
+    largura, altura = pyautogui.size()
+    pyautogui.moveTo(largura * 0.45, altura * 0.25)
+    print("✅ 2.ª plataforma adicionada (Count = 1).")
+    return True
+
+def configurar_slice_todas_plataformas():
+    """S, L abre o painel Slice; escolhe Current -> All Platform; volta ao Prepare (Esc).
+    Corre em cada item, depois de a mesa ter sido limpa e as peças importadas."""
+    print("A abrir o painel Slice (S L) para escolher 'All Platform'...")
+    pyautogui.press('s')
+    time.sleep(0.5)
+    pyautogui.press('l')
+    time.sleep(3)
+
+    dropdown = localizar_na_tela(IMG_SLICE_CURRENT)
+    if dropdown:
+        pyautogui.click(dropdown)
+        time.sleep(1)
+        opcao = localizar_na_tela(IMG_SLICE_ALL)
+        if opcao:
+            pyautogui.click(opcao)
+            time.sleep(1)
+            print("✅ Modo de slice: All Platform.")
+        else:
+            caminho_debug = os.path.join(PASTA_BASE, "debug_slice_mode.png")
+            pyautogui.screenshot().save(caminho_debug)
+            print(f"❌ Opção 'All Platform' não encontrada. Captura de debug: {caminho_debug}")
+            pyautogui.press('esc')
+    else:
+        print("ℹ️ Dropdown 'Current Platform' não encontrado — a seguir com o modo atual.")
+
+    # Voltar ao Prepare: Esc fecha o painel Slice
+    pyautogui.press('esc')
+    time.sleep(3)
+    print("A voltar ao Prepare.")
 
 def trazer_chitubox_para_frente():
     """Best-effort: ativa a janela do CHITUBOX antes de capturar o ecrã."""
@@ -101,20 +188,32 @@ def aguardar_e_salvar_print(nome_arquivo, quantidade=None):
     nome_limpo = os.path.splitext(nome_arquivo)[0]
     caminho_print = os.path.join(PASTA_CAPTURAS, f"resultado_{nome_limpo}.png")
 
+    limite = max(LIMITE_MINIMO_ESPERA, tempo_espera * FATOR_LIMITE_ESPERA)
+    inicio = time.time()
+    largura, altura = pyautogui.size()
     campos = {}
-    for tentativa in range(1, 4):
+    while True:
         trazer_chitubox_para_frente()
+        # rato para uma zona vazia: o tooltip do painel Slice não pode tapar os números
+        pyautogui.moveTo(largura * 0.45, altura * 0.25)
         pyautogui.screenshot().save(caminho_print)
-        campos = extrair_campos(transcrever_imagem(recortar_esquerda(caminho_print)))
-        if campos.get("weight_g"):
+        linhas = transcrever_imagem(recortar_esquerda(caminho_print))
+        campos = extrair_campos(linhas)
+        if campos.get("weight_g") and campos.get("time"):
             break
-        if tentativa < 3:
-            print(f"⏳ Dados ainda não prontos ('Calculating...' ou CHITUBOX não visível). Nova tentativa em 15s ({tentativa}/3)...")
-            time.sleep(15)
+        decorrido = int(tempo_espera + (time.time() - inicio))
+        if decorrido >= limite:
+            break
+        a_calcular = any("calculat" in linha.lower() for linha in linhas)
+        motivo = "ainda a calcular" if a_calcular else "dados ainda não visíveis"
+        print(f"⏳ {motivo}... nova leitura em {INTERVALO_LEITURA}s ({decorrido}/{limite}s)")
+        time.sleep(INTERVALO_LEITURA)
 
     print(f"📸 Captura guardada: resultado_{nome_limpo}.png")
-    if not campos.get("weight_g"):
-        print("⚠️ Aviso: não foi possível ler Weight/Time na captura.")
+    if campos.get("weight_g"):
+        print(f"✅ Dados lidos: {campos.get('weight_g')} | {campos.get('time') or '?'}")
+    else:
+        print(f"⚠️ Aviso: não foi possível ler Weight na captura após {limite}s.")
 
 def voltar_para_mesa(tentativas=5, intervalo=3):
     print("À procura da imagem 'botao_voltar.png' no ecrã...")
@@ -159,24 +258,32 @@ def importar_arquivo_teclado(caminho_completo):
     time.sleep(2) 
     
     print("A digitar o caminho do ficheiro...")
-    pyautogui.write(caminho_completo)
+    pyautogui.write(caminho_completo, interval=0.02)
     time.sleep(1)
-    
+
     print("A confirmar injeção (Enter)...")
     pyautogui.press('enter')
-    
+
     print("A aguardar 10 segundos para a peça carregar na mesa...")
     time.sleep(10)
 
-def modo_misto():
-    """Lida automaticamente com ficheiros soltos e pastas (Kits/Personagens)"""
+def modo_misto(filtro=None):
+    """Lida automaticamente com ficheiros soltos e pastas (Kits/Personagens).
+    'filtro' (lista de nomes) limita o processamento a esses itens."""
     todos_itens = os.listdir(PASTA_ORIGEM_STL)
-    
+
     itens_validos = []
     for item in todos_itens:
         caminho_item = os.path.join(PASTA_ORIGEM_STL, item)
         if os.path.isdir(caminho_item) or (os.path.isfile(caminho_item) and tem_extensao_valida(item)):
             itens_validos.append(item)
+
+    if filtro:
+        escolhidos = [i for i in itens_validos if i.lower() in filtro]
+        nao_encontrados = [n for n in filtro if n not in [i.lower() for i in itens_validos]]
+        for nome in nao_encontrados:
+            print(f"⚠️ Não encontrado em '{PASTA_ORIGEM_STL}': {nome}")
+        itens_validos = escolhidos
 
     if not itens_validos:
         print(f"❌ Erro: Nenhum ficheiro {', '.join(EXTENSOES_VALIDAS)} ou pasta válida encontrada em:\n{PASTA_ORIGEM_STL}")
@@ -208,10 +315,15 @@ def modo_misto():
                     print("A aguardar 15 segundos para o software iniciar e carregar a peça...")
                     time.sleep(15)
                     software_aberto = True
-                else:
+                elif IMPORTAR_RESTANTES:
                     print(f"A injetar a peça {i+1}/{len(ficheiros_na_pasta)} na mesma mesa: {ficheiro}")
                     importar_arquivo_teclado(caminho_ficheiro)
-            
+                else:
+                    print(f"Peça {i+1}/{len(ficheiros_na_pasta)} ({ficheiro}) — já colocada manualmente, não importada.")
+
+            # Todas as peças do item estão na mesa: 2.ª plataforma e depois o All Platform (em cada item)
+            adicionar_plataforma_por_atalho()
+            configurar_slice_todas_plataformas()
             print(f"A processar e fatiar o lote completo da pasta '{item}'...")
             aplicar_comando_lo1() # <--- NOVO COMANDO AQUI
             executar_fatiamento_teclado()
@@ -229,10 +341,15 @@ def modo_misto():
                 print("A aguardar 15 segundos para o software iniciar e carregar a peça...")
                 time.sleep(15)
                 software_aberto = True
-            else:
+            elif IMPORTAR_RESTANTES:
                 print(f"A injetar o ficheiro na mesa vazia: {item}")
                 importar_arquivo_teclado(caminho_completo)
-            
+            else:
+                print(f"Ficheiro {item} — já colocado manualmente, não importado.")
+
+            # Ficheiro na mesa: 2.ª plataforma e depois o All Platform (em cada item)
+            adicionar_plataforma_por_atalho()
+            configurar_slice_todas_plataformas()
             aplicar_comando_lo1() # <--- NOVO COMANDO AQUI
             executar_fatiamento_teclado()
             aguardar_e_salvar_print(item)
@@ -251,6 +368,8 @@ def modo_tudo_junto(arquivos):
 
     subprocess.Popen(lista_comandos)
     time.sleep(20)
+    adicionar_plataforma_por_atalho()
+    configurar_slice_todas_plataformas()
 
     aplicar_comando_lo1() # <--- NOVO COMANDO AQUI
     executar_fatiamento_teclado()
@@ -368,12 +487,20 @@ def iniciar_robo():
     print(" [ 1 ] Fatiamento Misto (Processa pastas/kits e ficheiros soltos na ordem)")
     print(" [ 2 ] Fatiar TUDO JUNTO (Ignora pastas, joga todos os ficheiros soltos juntos)")
     print(" [ 3 ] Processar capturas existentes (corte ao meio + OCR -> CSV)")
+    print(" [ 4 ] Reprocessar item(s) específico(s) (digite o nome da pasta/ficheiro)")
     print("==============================================")
 
-    opcao = input("Digite a opção desejada (1, 2 ou 3): ").strip()
+    opcao = input("Digite a opção desejada (1, 2, 3 ou 4): ").strip()
 
     if opcao == "1":
         modo_misto()
+    elif opcao == "4":
+        nomes = input("Nome(s) da pasta/ficheiro, separados por vírgula: ").strip()
+        filtro = [n.strip().lower() for n in nomes.split(",") if n.strip()]
+        if filtro:
+            modo_misto(filtro=filtro)
+        else:
+            print("❌ Nenhum nome digitado.")
     elif opcao == "2":
         arquivos = [f for f in os.listdir(PASTA_ORIGEM_STL) if tem_extensao_valida(f) and os.path.isfile(os.path.join(PASTA_ORIGEM_STL, f))]
         if arquivos:

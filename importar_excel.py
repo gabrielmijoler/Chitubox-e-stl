@@ -6,6 +6,9 @@ Importa registos do CSV (rodada do robô) para a planilha Excel de destino.
 - Insere na primeira linha vazia da folha do Excel, sem sobrescrever dados
 - Ignora registos já existentes (duplicados)
 - Cria o Excel com cabeçalho se ainda não existir
+- Regrava a "- Copia.xlsx" a cada rodada (sempre o mesmo ficheiro, só com as peças da rodada)
+- Quantidade Equivalente (coluna I) = 1 + ROUNDDOWN(SQRT(peso / 25)): é pôr a fórmula nas linhas novas
+  e nas linhas com nome cuja coluna I está vazia ou com o 1 fixo (valor manual diferente de 1 não é tocado)
 
 Uso:
     python importar_excel.py                       # usa as constantes abaixo
@@ -19,12 +22,12 @@ import math
 import re
 import shutil
 import sys
-import time
 from pathlib import Path
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
 from openpyxl.worksheet.table import Table
+from openpyxl.worksheet.worksheet import Worksheet
 
 # --- CONFIGURAÇÃO (editável) ---
 PASTA_BASE = Path(__file__).resolve().parent
@@ -33,13 +36,16 @@ PASTA_RESULTADOS = PASTA_BASE / "resultados"
 # None = usa automaticamente o CSV mais recente da pasta PASTA_RESULTADOS
 CSV_ORIGEM: str | None = None
 
-EXCEL_DESTINO = r"D:\Arquivos Impressão 3D\Shopee\New Calculadora 3D - Copia.xlsx"
+EXCEL_DESTINO = r"D:\Arquivos Impressão 3D\Shopee\New Calculadora 3D.xlsx"
+EXCEL_COPIA = r"D:\Arquivos Impressão 3D\Shopee\New Calculadora 3D - Copia.xlsx"  # sobrescrita a cada rodada
 FOLHA_DESTINO = "Pecas"
 
 # Posições das colunas na folha destino (A..E)
 COL_NOME = 1    # A: Nome do arquivo
 COL_PESO = 4    # D: Peso (g)
 COL_TEMPO = 5   # E: Tempo (h)
+COL_QTD = 9    # I: Quantidade Equivalente (fórmula pelo peso)
+GRAMAS_POR_UNIDADE = 25   # cresce com a raiz quadrada de peso/25 (acabamento escala com a área)
 CABECALHOS_NOVOS = ["Nome do arquivo", "Altura (mm)", "Largura (mm)", "Peso (g)", "Tempo (h)"]
 
 # Sinónimos aceites por campo (cabeçalhos comparados em minúsculas, sem espaços extra)
@@ -184,6 +190,8 @@ def abrir_ou_criar_excel(caminho: Path) -> tuple[Workbook, bool]:
     if not caminho.exists():
         wb = Workbook()
         ws = wb.active
+        if not isinstance(ws, Worksheet):
+            raise RuntimeError("não foi possível criar a folha inicial do Excel")
         ws.title = FOLHA_DESTINO
         for indice, cabecalho in enumerate(CABECALHOS_NOVOS, start=1):
             ws.cell(row=1, column=indice, value=cabecalho)
@@ -228,6 +236,47 @@ def proxima_linha_livre(ws, linha: int) -> int:
     return linha
 
 
+def formula_quantidade(linha: int) -> str:
+    """Quantidade Equivalente = 1 + ROUNDDOWN(SQRT(peso / 25)), com o peso na coluna D da mesma linha."""
+    return f"=1+ROUNDDOWN(SQRT(D{linha}/{GRAMAS_POR_UNIDADE}),0)"
+
+
+def corrigir_quantidades(ws) -> int:
+    """Linhas com nome e peso numérico cuja coluna I está vazia ou com o 1 fixo recebem a fórmula.
+    Fórmulas existentes e valores manuais diferentes de 1 não são tocados. Devolve quantas corrigiu."""
+    corrigidas = 0
+    for linha in range(2, ws.max_row + 1):
+        nome = ws.cell(row=linha, column=COL_NOME).value
+        if nome in (None, ""):
+            continue
+        peso = ws.cell(row=linha, column=COL_PESO).value
+        if not isinstance(peso, (int, float)):
+            continue
+        qtd = ws.cell(row=linha, column=COL_QTD).value
+        if qtd in (None, "", 1):
+            ws.cell(row=linha, column=COL_QTD, value=formula_quantidade(linha))
+            corrigidas += 1
+    return corrigidas
+
+
+def regravar_copia(caminho: Path, registos: list[tuple[str, float | None, float | None]]) -> None:
+    """Cria (ou sobrescreve) a planilha cópia só com as peças da rodada: A nome, D peso, E tempo, I quantidade."""
+    wb = Workbook()
+    ws = wb.active
+    if not isinstance(ws, Worksheet):
+        raise RuntimeError("não foi possível criar a folha da cópia")
+    ws.title = FOLHA_DESTINO
+    for indice, cabecalho in enumerate(CABECALHOS_NOVOS, start=1):
+        ws.cell(row=1, column=indice, value=cabecalho)
+    ws.cell(row=1, column=COL_QTD, value="Quantidade Equivalente")
+    for linha, (nome, peso, tempo) in enumerate(registos, start=2):
+        ws.cell(row=linha, column=COL_NOME, value=nome)
+        ws.cell(row=linha, column=COL_PESO, value=peso)
+        ws.cell(row=linha, column=COL_TEMPO, value=tempo)
+        ws.cell(row=linha, column=COL_QTD, value=formula_quantidade(linha))
+    wb.save(caminho)
+
+
 def expandir_tabela(ws, ultima_linha: int) -> None:
     """Alarga a tabela/AutoFilter do Excel se escrevemos além do fim atual (ex.: A1:N2206)."""
     for tabela in ws.tables.values():
@@ -245,9 +294,21 @@ def expandir_tabela(ws, ultima_linha: int) -> None:
 
 # --- PRINCIPAL ---
 
-def main() -> int:
-    caminho_csv = Path(sys.argv[1]) if len(sys.argv) > 1 else None
-    caminho_excel = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(EXCEL_DESTINO)
+def calculadora_aberta_no_excel(caminho) -> bool:
+    """O Excel cria o ficheiro '~$<nome>' na mesma pasta enquanto o documento está aberto."""
+    caminho = Path(caminho)
+    return (caminho.parent / f"~${caminho.name}").exists()
+
+
+def executar(caminho_csv: str | Path | None = None, caminho_excel: str | Path | None = None) -> int:
+    """Importa o CSV para a folha 'Pecas'. Chamável pelo robô; sem argumentos usa as constantes."""
+    caminho_csv = Path(caminho_csv) if caminho_csv else None
+    caminho_excel = Path(caminho_excel) if caminho_excel else Path(EXCEL_DESTINO)
+
+    if calculadora_aberta_no_excel(caminho_excel):
+        print("❌ A calculadora está aberta no Excel. Guarde (Ctrl+S) e feche-a, e corra de novo.")
+        print(f"   (Se o Excel já estiver fechado, apague o ficheiro '~$...' na pasta: {caminho_excel.parent})")
+        return 1
 
     # 1) Resolver e ler o CSV
     try:
@@ -309,19 +370,23 @@ def main() -> int:
         linha_actual += 1
         inseridos += 1
 
-    # 5) Guardar apenas se houver novidades
-    if inseridos == 0:
+    corrigidas = corrigir_quantidades(ws)
+    if corrigidas:
+        print(f"🔧 {corrigidas} linha(s) com Quantidade Equivalente corrigida(s) (fórmula pelo peso)")
+
+    # 5) Guardar apenas se houver novidades ou correções
+    if inseridos == 0 and corrigidas == 0:
         print(f"\n📊 Importados: 0 | Duplicados ignorados: {duplicados} | Inválidas: {ignoradas}")
         print("Nada a gravar — o Excel não foi alterado.")
         return 0
 
-    expandir_tabela(ws, ultima_escrita)
+    if inseridos and ultima_escrita is not None:
+        expandir_tabela(ws, ultima_escrita)
     wb.calculation.fullCalcOnLoad = True  # força o Excel a recalcular as fórmulas ao abrir
 
     # Backup antes de gravar (protege os dados já existentes)
     if not era_novo and caminho_excel.exists():
-        carimbo = time.strftime("%Y-%m-%d_%H-%M-%S")
-        backup = caminho_excel.with_name(f"{caminho_excel.stem}_backup_{carimbo}{caminho_excel.suffix}")
+        backup = caminho_excel.with_name(f"{caminho_excel.stem}_backup{caminho_excel.suffix}")  # único, substituído
         shutil.copy2(caminho_excel, backup)
         print(f"💾 Backup criado: {backup.name}")
 
@@ -331,9 +396,46 @@ def main() -> int:
         print(f"❌ Não foi possível gravar — o ficheiro está aberto no Excel? Feche-o e tente de novo: {caminho_excel}")
         return 1
 
+    copia = Path(EXCEL_COPIA)
+    if copia != caminho_excel:
+        try:
+            regravar_copia(copia, registos)
+            print(f"📋 Cópia regravada: {copia.name} ({len(registos)} peça(s) da rodada)")
+        except PermissionError:
+            print(f"⚠️ Cópia não gravada (aberta no Excel?): {copia}")
+
     print(f"\n📊 Importados: {inseridos} | Duplicados ignorados: {duplicados} | Inválidas: {ignoradas}")
-    print(f"📗 Gravado em: {caminho_excel} (folha '{FOLHA_DESTINO}', linhas {primeira_escrita}..{ultima_escrita})")
+    if inseridos:
+        print(f"📗 Gravado em: {caminho_excel} (folha '{FOLHA_DESTINO}', linhas {primeira_escrita}..{ultima_escrita})")
+    else:
+        print(f"📗 Gravado em: {caminho_excel} (folha '{FOLHA_DESTINO}', só correção de Quantidade Equivalente)")
     return 0
+
+
+def main() -> int:
+    # Uso com argumentos (linha de comando): comportamento de sempre
+    if len(sys.argv) > 1:
+        caminho_excel = sys.argv[2] if len(sys.argv) > 2 else None
+        return executar(sys.argv[1], caminho_excel)
+
+    # Uso manual: pergunta a fonte antes de rodar
+    print("Fonte dos dados:")
+    print(" [ 1 ] CSV mais recente em resultados/ (como funciona agora)")
+    print(" [ 2 ] Todas as capturas em imagens/ (gera um CSV novo com OCR e importa)")
+    opcao = input("Digite a opção (1 ou 2): ").strip()
+
+    if opcao == "1":
+        return executar()
+    if opcao == "2":
+        import automatizar_chitubox  # só ao escolher esta opção (o módulo não roda nada ao ser importado)
+        caminho_csv = automatizar_chitubox.processar_capturas()
+        if not caminho_csv:
+            print("❌ Nenhuma captura 'resultado_*.png' encontrada em imagens/.")
+            return 1
+        return executar(caminho_csv)
+
+    print("❌ Opção inválida.")
+    return 1
 
 
 if __name__ == "__main__":

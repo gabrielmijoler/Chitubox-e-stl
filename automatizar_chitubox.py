@@ -1,6 +1,7 @@
 import os
 import re
 import csv
+import sys
 import time
 import subprocess
 import pyautogui
@@ -64,8 +65,79 @@ IMPORTAR_RESTANTES = True
 
 pyautogui.FAILSAFE = True
 
+class ErroChitubox(Exception):
+    """O CHITUBOX não está disponível ou não reagiu como esperado; o robô para neste item."""
+
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+def _api_clipboard():
+    """Funções da API do Windows para o clipboard (ctypes, sem janela nem dependência extra)."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    return ctypes, user32, kernel32
+
+def _clipboard_ler():
+    """Texto atual do clipboard, ou None se não houver texto."""
+    ctypes, user32, kernel32 = _api_clipboard()
+    if not user32.OpenClipboard(None):
+        return None
+    try:
+        memoria = user32.GetClipboardData(CF_UNICODETEXT)
+        if not memoria:
+            return None
+        ponteiro = kernel32.GlobalLock(memoria)
+        try:
+            return ctypes.wstring_at(ponteiro)
+        finally:
+            kernel32.GlobalUnlock(memoria)
+    finally:
+        user32.CloseClipboard()
+
+def _clipboard_definir(texto):
+    """Põe 'texto' (Unicode, com acentos) no clipboard."""
+    ctypes, user32, kernel32 = _api_clipboard()
+    dados = texto.encode("utf-16-le") + b"\x00\x00"
+    memoria = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(dados))
+    ponteiro = kernel32.GlobalLock(memoria)
+    ctypes.memmove(ponteiro, dados, len(dados))
+    kernel32.GlobalUnlock(memoria)
+    if not user32.OpenClipboard(None):
+        raise OSError("não foi possível abrir o clipboard")
+    try:
+        user32.EmptyClipboard()
+        if not user32.SetClipboardData(CF_UNICODETEXT, memoria):
+            raise OSError("SetClipboardData falhou")
+    finally:
+        user32.CloseClipboard()
+
+def escrever_texto(texto):
+    """Cola 'texto' pelo clipboard (aceita acentos). Se o clipboard falhar, digita como antes."""
+    try:
+        anterior = _clipboard_ler()
+        _clipboard_definir(texto)
+        pyautogui.hotkey('ctrl', 'v')
+        time.sleep(0.5)
+        if anterior is not None:
+            _clipboard_definir(anterior)   # devolve o que o utilizador tinha copiado
+    except Exception as erro:  # noqa: BLE001
+        print(f"⚠️ Clipboard indisponível ({erro}); a digitar o caminho (sem acentos)...")
+        pyautogui.write(texto, interval=0.02)
+
 def aplicar_comando_lo1():
     """Executa a sequência L, O, 1 antes de iniciar o fatiamento"""
+    garantir_chitubox_ativo()
     print("A executar comando pré-slice (L -> O -> 1)...")
     pyautogui.press('l')
     time.sleep(0.5)
@@ -75,6 +147,7 @@ def aplicar_comando_lo1():
     time.sleep(2) # Pausa para a ação estabilizar antes de fatiar
 
 def executar_fatiamento_teclado():
+    garantir_chitubox_ativo()
     print("A enviar o comando de fatiamento via teclado (S L)...")
     pyautogui.press('s')
     time.sleep(0.5) 
@@ -99,7 +172,7 @@ def adicionar_plataforma_por_atalho():
     """Adiciona a 2.ª plataforma: A, P abre o painel Add Platform; clica no 5 da caixa Count,
     escreve 1 e Enter (Apply)."""
     print("A adicionar a 2.ª plataforma (A -> P -> Count 1 -> Enter)...")
-    trazer_chitubox_para_frente()
+    garantir_chitubox_ativo()
     pyautogui.press('a')
     time.sleep(0.5)
     pyautogui.press('p')
@@ -132,6 +205,7 @@ def adicionar_plataforma_por_atalho():
 def configurar_slice_todas_plataformas():
     """S, L abre o painel Slice; escolhe Current -> All Platform; volta ao Prepare (Esc).
     Corre em cada item, depois de a mesa ter sido limpa e as peças importadas."""
+    garantir_chitubox_ativo()
     print("A abrir o painel Slice (S L) para escolher 'All Platform'...")
     pyautogui.press('s')
     time.sleep(0.5)
@@ -178,6 +252,15 @@ def trazer_chitubox_para_frente():
         pass
     return False
 
+def garantir_chitubox_ativo():
+    """Levanta ErroChitubox se a janela do CHITUBOX não existir (evita enviar atalhos a outra janela, p. ex. o VS Code)."""
+    if not trazer_chitubox_para_frente():
+        raise ErroChitubox("janela do CHITUBOX não encontrada (está aberto?)")
+
+def caminho_captura_de(nome_arquivo):
+    """Caminho da captura de um item: imagens/resultado_<nome sem extensão>.png."""
+    return os.path.join(PASTA_CAPTURAS, f"resultado_{os.path.splitext(nome_arquivo)[0]}.png")
+
 def aguardar_e_salvar_print(nome_arquivo, quantidade=None):
     if quantidade is None:
         quantidade = contar_ficheiros_para_fatiar(os.path.join(PASTA_ORIGEM_STL, nome_arquivo))
@@ -186,7 +269,7 @@ def aguardar_e_salvar_print(nome_arquivo, quantidade=None):
     time.sleep(tempo_espera)
     
     nome_limpo = os.path.splitext(nome_arquivo)[0]
-    caminho_print = os.path.join(PASTA_CAPTURAS, f"resultado_{nome_limpo}.png")
+    caminho_print = caminho_captura_de(nome_arquivo)
 
     limite = max(LIMITE_MINIMO_ESPERA, tempo_espera * FATOR_LIMITE_ESPERA)
     inicio = time.time()
@@ -214,6 +297,7 @@ def aguardar_e_salvar_print(nome_arquivo, quantidade=None):
         print(f"✅ Dados lidos: {campos.get('weight_g')} | {campos.get('time') or '?'}")
     else:
         print(f"⚠️ Aviso: não foi possível ler Weight na captura após {limite}s.")
+    return caminho_print
 
 def voltar_para_mesa(tentativas=5, intervalo=3):
     print("À procura da imagem 'botao_voltar.png' no ecrã...")
@@ -235,10 +319,11 @@ def voltar_para_mesa(tentativas=5, intervalo=3):
     print(f"❌ Botão 'voltar' não encontrado após {tentativas} tentativas.")
     print(f"   Captura de debug guardada: {caminho_debug}")
     print("   Compara-a com 'botao_voltar.png' — se o aspeto do ecrã mudou, recorta o botão de novo.")
-    return False
+    raise ErroChitubox("botão 'voltar' não encontrado")
 
 def limpar_mesa():
     """Garante que a mesa é limpa após cada slice"""
+    garantir_chitubox_ativo()
     print("🧹 A focar na mesa 3D e a limpar a peça atual...")
     
     # Clica no centro da tela para garantir foco na mesa 3D antes de apagar
@@ -252,31 +337,47 @@ def limpar_mesa():
     pyautogui.press('delete')
     time.sleep(1)
 
+def verificar_importacao(caminho_completo):
+    """Depois do Enter, procura o aviso 'O caminho não existe' do CHITUBOX; se aparecer, fecha-o e para o robô."""
+    time.sleep(2)
+    captura = os.path.join(PASTA_BASE, "debug_importacao.png")
+    pyautogui.screenshot().save(captura)
+    linhas = transcrever_imagem(captura)
+    if any("caminho" in linha.lower() and "existe" in linha.lower() for linha in linhas):
+        pyautogui.press('enter')   # fecha o aviso (OK)
+        raise ErroChitubox(f"o CHITUBOX não encontrou o ficheiro '{caminho_completo}' (captura: {captura})")
+
 def importar_arquivo_teclado(caminho_completo):
+    garantir_chitubox_ativo()
     print("A abrir janela de importação (Ctrl + O)...")
     pyautogui.hotkey('ctrl', 'o')
     time.sleep(2) 
     
-    print("A digitar o caminho do ficheiro...")
-    pyautogui.write(caminho_completo, interval=0.02)
+    print("A colar o caminho do ficheiro...")
+    escrever_texto(caminho_completo)
     time.sleep(1)
 
     print("A confirmar injeção (Enter)...")
     pyautogui.press('enter')
+    verificar_importacao(caminho_completo)
 
     print("A aguardar 10 segundos para a peça carregar na mesa...")
     time.sleep(10)
 
-def modo_misto(filtro=None):
-    """Lida automaticamente com ficheiros soltos e pastas (Kits/Personagens).
-    'filtro' (lista de nomes) limita o processamento a esses itens."""
-    todos_itens = os.listdir(PASTA_ORIGEM_STL)
-
+def listar_itens_validos():
+    """Pastas e ficheiros válidos em PASTA_ORIGEM_STL, na ordem do disco."""
     itens_validos = []
-    for item in todos_itens:
+    for item in os.listdir(PASTA_ORIGEM_STL):
         caminho_item = os.path.join(PASTA_ORIGEM_STL, item)
         if os.path.isdir(caminho_item) or (os.path.isfile(caminho_item) and tem_extensao_valida(item)):
             itens_validos.append(item)
+    return itens_validos
+
+def modo_misto(filtro=None, inicio=0):
+    """Lida automaticamente com ficheiros soltos e pastas (Kits/Personagens).
+    'filtro' (lista de nomes) limita o processamento a esses itens.
+    'inicio' (índice em listar_itens_validos) é o ponto de re-start: os itens antes dele são saltados."""
+    itens_validos = listar_itens_validos()
 
     if filtro:
         escolhidos = [i for i in itens_validos if i.lower() in filtro]
@@ -291,9 +392,31 @@ def modo_misto(filtro=None):
 
     print(f"\n🚀 A iniciar fatiamento MISTO de {len(itens_validos)} itens (Arquivos Soltos e Pastas/Kits).")
     
+    capturas_run = []   # capturas deste run (só estas vão para o CSV e para a planilha Shopee)
+    for item in itens_validos[:inicio]:
+        captura = caminho_captura_de(item)
+        if os.path.isfile(captura):
+            capturas_run.append(captura)
+        else:
+            print(f"⚠️ '{item}' sem captura em imagens/; saltado (não entra no CSV).")
+    if inicio:
+        print(f"⏭️ A saltar {inicio} item(s) já processados; as suas capturas entram no CSV.")
+    progresso = {"index": None, "item": None}   # onde o robô está, para a mensagem de re-start
+    try:
+        _fatiar_fila(itens_validos, inicio, capturas_run, progresso)
+    except ErroChitubox as erro:
+        print(f"\n⛔ Parado no item '{progresso['item']}': {erro}")
+        print(f"   Para retomar: rode o robô, opção 1, e indique o re-start {progresso['index'] + 1} ({progresso['item']}).")
+    caminho_csv = processar_capturas(capturas_run)
+    executar_pos_processamento(caminho_csv)
+
+def _fatiar_fila(itens_validos, inicio, capturas_run, progresso):
     software_aberto = False
 
     for index, item in enumerate(itens_validos):
+        if index < inicio:
+            continue
+        progresso["index"], progresso["item"] = index, item
         caminho_completo = os.path.join(PASTA_ORIGEM_STL, item)
         
         # CENÁRIO 1: É UMA PASTA
@@ -327,7 +450,7 @@ def modo_misto(filtro=None):
             print(f"A processar e fatiar o lote completo da pasta '{item}'...")
             aplicar_comando_lo1() # <--- NOVO COMANDO AQUI
             executar_fatiamento_teclado()
-            aguardar_e_salvar_print(item) 
+            capturas_run.append(aguardar_e_salvar_print(item))
             voltar_para_mesa()
             limpar_mesa()
 
@@ -352,12 +475,11 @@ def modo_misto(filtro=None):
             configurar_slice_todas_plataformas()
             aplicar_comando_lo1() # <--- NOVO COMANDO AQUI
             executar_fatiamento_teclado()
-            aguardar_e_salvar_print(item)
+            capturas_run.append(aguardar_e_salvar_print(item))
             voltar_para_mesa()
             limpar_mesa()
             
     print("\n🏁 Fim da fila de ficheiros e pastas.")
-    processar_capturas()
 
 def modo_tudo_junto(arquivos):
     print(f"\n🚀 Modo 2 selecionado: A colocar todos os {len(arquivos)} ficheiros soltos na mesma mesa.")
@@ -368,15 +490,20 @@ def modo_tudo_junto(arquivos):
 
     subprocess.Popen(lista_comandos)
     time.sleep(20)
-    adicionar_plataforma_por_atalho()
-    configurar_slice_todas_plataformas()
-
-    aplicar_comando_lo1() # <--- NOVO COMANDO AQUI
-    executar_fatiamento_teclado()
-    aguardar_e_salvar_print("LOTE_COMPLETO_JUNTO.stl", quantidade=len(arquivos))
-    voltar_para_mesa()
-    limpar_mesa()
-    processar_capturas()
+    try:
+        adicionar_plataforma_por_atalho()
+        configurar_slice_todas_plataformas()
+        aplicar_comando_lo1() # <--- NOVO COMANDO AQUI
+        executar_fatiamento_teclado()
+        captura = aguardar_e_salvar_print("LOTE_COMPLETO_JUNTO.stl", quantidade=len(arquivos))
+        voltar_para_mesa()
+        limpar_mesa()
+    except ErroChitubox as erro:
+        print(f"\n⛔ Parado: {erro}")
+        print("   Corrija o problema e rode de novo (opção 2), ou use a opção 3 para processar as capturas já feitas.")
+        return
+    caminho_csv = processar_capturas([captura])
+    executar_pos_processamento(caminho_csv)
 
 # --- PÓS-PROCESSAMENTO: CORTE + OCR + CSV ---
 
@@ -445,17 +572,22 @@ def caminho_csv_novo():
         contador += 1
     return caminho
 
-def processar_capturas():
-    """Corta todas as capturas ao meio, transcreve o lado esquerdo e gera o CSV."""
-    capturas = sorted(
-        f for f in os.listdir(PASTA_CAPTURAS)
-        if f.lower().startswith("resultado_") and f.lower().endswith(".png")
-        and not f.lower().endswith("_esq.png")
-    )
+def processar_capturas(capturas_run=None):
+    """Corta as capturas ao meio, transcreve o lado esquerdo e gera o CSV.
+    capturas_run: caminhos das capturas deste run; sem lista, usa todas as de imagens/.
+    Devolve o caminho do CSV gerado (ou None)."""
+    if capturas_run is not None:
+        capturas = [os.path.basename(c) for c in capturas_run if os.path.isfile(c)]
+    else:
+        capturas = sorted(
+            f for f in os.listdir(PASTA_CAPTURAS)
+            if f.lower().startswith("resultado_") and f.lower().endswith(".png")
+            and not f.lower().endswith("_esq.png")
+        )
 
     if not capturas:
         print(f"⚠️ Nenhuma captura 'resultado_*.png' encontrada em:\n{PASTA_CAPTURAS}")
-        return
+        return None
 
     print(f"\n🔎 A processar {len(capturas)} captura(s): corte ao meio + OCR -> CSV")
 
@@ -478,6 +610,45 @@ def processar_capturas():
         escritor.writerows(registos)
 
     print(f"📄 CSV guardado: {caminho_csv}")
+    return caminho_csv
+
+def executar_pos_processamento(caminho_csv):
+    """Encadeia no fim do robô: importa o CSV para a calculadora e gera a planilha Shopee do run.
+    O CSV já está guardado, por isso uma falha aqui não perde os resultados."""
+    if not caminho_csv:
+        return
+    if PASTA_BASE not in sys.path:
+        sys.path.insert(0, PASTA_BASE)
+    print("\n=== Pós-processamento: calculadora + planilha Shopee ===")
+    try:
+        import importar_excel
+        import preencher_shopee
+        if importar_excel.executar(caminho_csv) != 0:
+            print("⛔ Importação para a calculadora falhou — planilha Shopee não gerada.")
+            return
+        preencher_shopee.executar(caminho_csv)
+    except Exception as erro:  # noqa: BLE001
+        print(f"❌ Pós-processamento falhou: {erro} (o CSV continua guardado em {caminho_csv})")
+
+def escolher_ponto_restart():
+    """Mostra os itens (✅ = já tem captura em imagens/) e devolve o índice do ponto de re-start (0 = do início)."""
+    itens = listar_itens_validos()
+    if not itens:
+        return 0
+    print("\nItens disponíveis (✅ = já tem captura em imagens/):")
+    for numero, item in enumerate(itens, 1):
+        marca = "✅" if os.path.isfile(caminho_captura_de(item)) else "  "
+        print(f" {marca} {numero:>3}. {item}")
+    resposta = input("Ponto de re-start (número ou nome; Enter = do início): ").strip()
+    if not resposta:
+        return 0
+    if resposta.isdigit() and 1 <= int(resposta) <= len(itens):
+        return int(resposta) - 1
+    nomes = [item.lower() for item in itens]
+    if resposta.lower() in nomes:
+        return nomes.index(resposta.lower())
+    print("❌ Ponto de re-start inválido; a começar do início.")
+    return 0
 
 def iniciar_robo():
     print("\n==============================================")
@@ -493,7 +664,7 @@ def iniciar_robo():
     opcao = input("Digite a opção desejada (1, 2, 3 ou 4): ").strip()
 
     if opcao == "1":
-        modo_misto()
+        modo_misto(inicio=escolher_ponto_restart())
     elif opcao == "4":
         nomes = input("Nome(s) da pasta/ficheiro, separados por vírgula: ").strip()
         filtro = [n.strip().lower() for n in nomes.split(",") if n.strip()]

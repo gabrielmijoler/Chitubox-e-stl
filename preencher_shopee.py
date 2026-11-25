@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-Preenche o template de criação em massa da Shopee com as peças da
-New Calculadora 3D (linhas 339-385 = 47 peças da migração).
+Gera a planilha de criação em massa da Shopee (template "basic") com as peças
+fatiadas no run atual.
 
-Modo agrupado (AGRUPAR_E): as peças são agrupadas por décadas de preço
-(int(preco//10)*10), lotes de até 10 variações, e cada grupo vira UM
-anúncio com variações (coluna E = chave de integração, mesma em todo
-o grupo). Título/descrição do grupo são genéricos (corrigíveis à mão);
-fotos (H e R..Z) ficam vazias para preenchimento manual.
+Cada peça do CSV de resultados vira UMA variação
+(coluna G = nome do modelo, K = preço). Cada execução cria um ficheiro novo em
+pasta shopee/ do projeto (Shopee_mass_upload_<data-hora>.xlsx); os anteriores não são tocados.
+
+As variações são agrupadas em tantos anúncios quantos forem precisos para respeitar a regra
+da Shopee: preço mais caro <= 4 x preço mais barato dentro de cada anúncio.
 
 Fases:
-  1. Preços  - Excel COM (read-only, ficheiro intacto): recalcular e ler K/L
-  2. Linhas  - montar em memória (grupos, variações, preços, canais)
-  3. Gravar  - patch activePane -> openpyxl -> validar listas -> salvar
-  4. Validar  - reabrir ficheiro final (DV counts, diff, grupos, valores)
+  1. Preços  - localizar as peças na calculadora e ler K/L (Excel COM, read-only)
+  2. Linhas  - montar em memória (variações, preços, canais)
+  3. Gravar  - patch activePane -> openpyxl -> validar listas -> salvar em ficheiro novo
+  4. Validar  - reabrir ficheiro final (DV counts, diff, valores, aviso de preço)
 
-Uso: .\\.venv\\Scripts\\python.exe preencher_shopee.py
+Uso: .\\.venv\\Scripts\\python.exe preencher_shopee.py [caminho do CSV]
+     (sem argumento: usa o CSV mais recente de resultados/)
 """
 
 from __future__ import annotations
@@ -24,35 +26,40 @@ import io
 import re
 import subprocess
 import sys
+import time
 import zipfile
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
-from openpyxl import load_workbook
+import importar_excel as ie
+from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter, range_boundaries
 
-if hasattr(sys.stdout, "reconfigure"):
+if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if isinstance(sys.stderr, io.TextIOWrapper):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # --- CONFIGURAÇÃO ----------------------------------------------------------
-CALCULADORA = Path(r"D:\Arquivos Impressão 3D\Shopee\New Calculadora 3D - Copia.xlsx")
+CALCULADORA = Path(r"D:\Arquivos Impressão 3D\Shopee\New Calculadora 3D.xlsx")
 TEMPLATE = Path(r"D:\Downloads\Shopee_mass_upload_2026-09-30_basic_template.xlsx")
-SAIDA = Path(r"D:\Downloads\Shopee_mass_upload_2026-09-30_agrupado.xlsx")
+PASTA_SAIDA = Path(__file__).resolve().parent / "shopee"
+PASTA_RESULTADOS = Path(__file__).resolve().parent / "resultados"
 
 FOLHA_CALC = "Pecas"
 FOLHA_TEMPLATE = "Modelo"
-LINHA_INI, LINHA_FIM = 339, 385          # bloco pós-último kit (339 = 1ª linha da migração)
 LINHA_DADOS_TEMPLATE = 7                  # primeira linha de dados do template
 
-# --- Agrupamento em variações (coluna E) ------------------------------------
-AGRUPAR_E = True                          # const: False = 1 anúncio por peça (modo antigo)
-GRUPO_MAX_VAR = 10                        # máx. de variações por anúncio; década cheia -> Lote novo
+# --- Agrupamento em anúncios (coluna E = 1, 2, ... ; razão preço <= RAZAO_PRECO_MAX) ---
+MAX_VARIACOES = 50                        # acima disto só avisa (limite real a confirmar na Shopee)
 PRE_ENCOMENDA = 3                         # AG: dias de postagem p/ encomenda (faixa cat 101385 = 3..15)
 NOME_VAR = "Modelo"                       # F: nome da variação 1
+NOME_TITULO_RUN = "Kit de Miniaturas"     # título genérico do anúncio (corrigível à mão)
 
 CATEGORIA = "101385"                      # Hobbies e Coleções/Itens Colecionáveis/Figuras de Ação
 ESTOQUE = 99999
+TERMINACAO_PRECO = Decimal("0.90")
+          # preço final = parte inteira + 0,90 (ex.: 21,15 -> 21,90)
 PESO_KG = 0.5                             # peso fixo do pacote (kg)
 COMPRIMENTO, LARGURA, ALTURA = 6, 16, 8   # caixa 6x16x8 cm, ordem escrita pelo utilizador
 CANAL_AE = "Ligado"                       # Shopee Xpress CPF - DV "Ligado,Desativado"
@@ -65,7 +72,7 @@ SUFIXO_TITULO = " - D&D Pathfinder Tormenta 20"
 LIMITE_TITULO = 120
 LIMITE_G = 30                             # coluna G: 1 a 30 caracteres
 LIMITE_M = 100                            # coluna M: menos de 100 caracteres
-RAZAO_PRECO_MAX = 4.00                    # Shopee: preço mais caro / mais barato do anúncio
+RAZAO_PRECO_MAX = 4.00                    # Shopee: preço mais caro <= 4 x preço mais barato
 
 DESCRICAO_MODELO = (
     "ATENÇÃO\n"
@@ -75,19 +82,16 @@ DESCRICAO_MODELO = (
     "\n"
     "  \n"
     "\n"
-    "Dimensões aproximadas das peças \n"
+    "Miniaturas na escala 32mm:\n"
+    "@NOME@\n"
     "\n"
-    "@NOME@ | @NOME@\n"
-    "\n"
-    "\n"
-    "IMPORTANTE: Produto enviado com base separado do restante da peça e com primer "
-    "preto, impressão é tratada com luz UV.\n"
-    "\n"
-    "\n"
-    "Somos uma marca preocupada em entregar o melhor produto para todos compradores. "
+    "IMPORTANTE: Produto enviado com a base e peças avulsas separadas para maior "
+    "segurança no envio. A impressão recebe tratamento em luz UV e já vai com primer "
+    "preto aplicado.\n"
+    "Somos uma marca preocupada em entregar o melhor produto para todos os compradores. "
     "Nosso foco está em miniaturas de RPG, criação de personagens customizados, cenários "
     "e terrenos para enriquecer a experiência de suas mesas, seja em campos de batalhas, "
-    "praças das cidades, esconderijos de ladrões, hordas de zumbis, monstros aterrorizadores "
+    "praças das cidades, esconderijos de ladrões, hordas de zumbis, monstros aterrorizantes "
     "e mercadores em apuros."
 )
 
@@ -103,8 +107,7 @@ COL = {
 PS_TEMPLATE = """
 $ErrorActionPreference = 'Stop'
 $planilha = '@@PLANILHA@@'
-$linhaIni = @@INI@@
-$linhaFim = @@FIM@@
+$linhas = @(@@LINHAS@@)
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
 $excel.DisplayAlerts = $false
@@ -114,12 +117,14 @@ try {
     $excel.CalculateFullRebuild()
     $ws = $wb.Worksheets.Item('Pecas')
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
-    for ($r = $linhaIni; $r -le $linhaFim; $r++) {
+    foreach ($r in $linhas) {
         $k = $ws.Cells.Item($r, 11).Value2
         $l = $ws.Cells.Item($r, 12).Value2
+        $o = $ws.Cells.Item($r, 15).Value2
         $ks = if ($null -eq $k -or $k -is [string]) { '' } else { ([double]$k).ToString('R', $inv) }
         $ls = if ($null -eq $l -or $l -is [string]) { '' } else { ([double]$l).ToString('R', $inv) }
-        Write-Output ('{0}|{1}|{2}' -f $r, $ks, $ls)
+        $os = if ($null -eq $o -or $o -is [string]) { '' } else { ([double]$o).ToString('R', $inv) }
+        Write-Output ('{0}|{1}|{2}|{3}' -f $r, $ks, $ls, $os)
     }
     $wb.Close($false)
 } finally {
@@ -129,15 +134,14 @@ try {
 """
 
 
-def obter_precos_com() -> dict[int, tuple[float | None, float | None]]:
-    """Abre a New Calculadora read-only, recalcula e devolve {linha: (K, L)}."""
+def obter_precos_com(linhas: list[int]) -> dict[int, tuple[float | None, float | None, float | None]]:
+    """Abre a New Calculadora read-only, recalcula e devolve {linha: (K, L)} para as linhas pedidas."""
     ps = (
         PS_TEMPLATE
         .replace("@@PLANILHA@@", str(CALCULADORA))
-        .replace("@@INI@@", str(LINHA_INI))
-        .replace("@@FIM@@", str(LINHA_FIM))
+        .replace("@@LINHAS@@", ",".join(str(r) for r in linhas))
     )
-    print(f"  Excel COM: abrir read-only, CalculateFullRebuild, ler K/L {LINHA_INI}..{LINHA_FIM} ...", flush=True)
+    print(f"  Excel COM: abrir read-only, CalculateFullRebuild, ler K/L de {len(linhas)} linha(s)...", flush=True)
     proc = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
@@ -148,42 +152,99 @@ def obter_precos_com() -> dict[int, tuple[float | None, float | None]]:
             + (proc.stderr or proc.stdout)
         )
 
-    dados: dict[int, tuple[float | None, float | None]] = {}
+    dados: dict[int, tuple[float | None, float | None, float | None]] = {}
     for linha in proc.stdout.splitlines():
-        m = re.match(r"^(\d+)\|([^|]*)\|(.*)$", linha.strip())
+        m = re.match(r"^(\d+)\|([^|]*)\|([^|]*)\|(.*)$", linha.strip())
         if not m:
             continue
         r = int(m.group(1))
         k = float(m.group(2)) if m.group(2).strip() else None
         l = float(m.group(3)) if m.group(3).strip() else None
-        dados[r] = (k, l)
+        o = float(m.group(4)) if m.group(4).strip() else None
+        dados[r] = (k, l, o)
 
-    esperadas = LINHA_FIM - LINHA_INI + 1
-    if len(dados) != esperadas:
-        raise RuntimeError(f"COM devolveu {len(dados)} linhas (esperado {esperadas}). stdout:\n{proc.stdout}")
+    faltam = [r for r in linhas if r not in dados]
+    if faltam:
+        raise RuntimeError(f"COM não devolveu as linhas {faltam}. stdout:\n{proc.stdout}")
     return dados
+
+
+def localizar_linhas(nomes: list[str]) -> tuple[dict[str, int], list[str]]:
+    """Procura cada nome na coluna A da folha Pecas. Se houver várias ocorrências, vale a última (mais recente)."""
+    wb = load_workbook(CALCULADORA, read_only=True, data_only=True)
+    ws = wb[FOLHA_CALC]
+    procurados = set(nomes)
+    encontrados: dict[str, int] = {}
+    for linha in ws.iter_rows(min_col=1, max_col=1):
+        cel = linha[0]
+        if cel.value is None:
+            continue
+        nome = str(cel.value).strip()
+        if nome in procurados and cel.row is not None:
+            encontrados[nome] = cel.row
+    wb.close()
+    faltam = [n for n in nomes if n not in encontrados]
+    return encontrados, faltam
+
+
+# --- LEITURA DO RUN -----------------------------------------------------------
+def resolver_csv(caminho: str | Path | None) -> Path:
+    """O CSV indicado, ou o mais recente de resultados/."""
+    if caminho:
+        p = Path(caminho)
+        if not p.is_file():
+            raise FileNotFoundError(f"CSV não encontrado: {p}")
+        return p
+    if not PASTA_RESULTADOS.is_dir():
+        raise FileNotFoundError(f"Pasta de CSVs não encontrada: {PASTA_RESULTADOS}")
+    candidatos = sorted(PASTA_RESULTADOS.glob("resultados_*.csv"), key=lambda p: p.stat().st_mtime)
+    if not candidatos:
+        raise FileNotFoundError(f"Nenhum CSV 'resultados_*.csv' encontrado em {PASTA_RESULTADOS}")
+    return candidatos[-1]
+
+
+def ler_run(caminho: Path) -> tuple[list[str], list[str]]:
+    """Nomes das peças do run com peso e tempo válidos (os mesmos que o importar_excel aceita).
+    Devolve (nomes, ignoradas)."""
+    df = ie.ler_csv(caminho)
+    colunas = ie.mapear_colunas(list(df.columns))
+    nomes: list[str] = []
+    ignoradas: list[str] = []
+    for _, linha in df.iterrows():
+        nome = ie.limpar(linha[colunas["nome"]])
+        if not nome:
+            continue
+        peso = ie.converter_peso(linha[colunas["peso"]])
+        tempo = ie.converter_tempo(linha[colunas["tempo"]])
+        if peso is None or tempo is None:
+            ignoradas.append(nome)
+            continue
+        if nome not in nomes:
+            nomes.append(nome)
+    return nomes, ignoradas
 
 
 # --- FASE 2: montar linhas ---------------------------------------------------
 def limpar_nome_titulo(nome: str) -> str:
-    n = re.sub(r"\s+", " ", str(nome).replace("_", " ")).strip()
+    """Nome do modelo para G/M/descrição: tira o sufixo das pastas do kit (_32mm_...),
+    separa CamelCase e troca '_' por espaço."""
+    n = re.sub(r"_?32mm_.*$", "", str(nome), flags=re.IGNORECASE)
+    n = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", n)
+    n = re.sub(r"\s+", " ", n.replace("_", " ")).strip()
     return n.strip("| ").strip()
 
 
-def construir_titulo(nome: str) -> str:
-    nome_t = limpar_nome_titulo(nome)
-    max_nome = LIMITE_TITULO - len(PREFIXO_TITULO) - len(SUFIXO_TITULO)
-    if len(nome_t) > max_nome:
-        nome_t = nome_t[:max_nome].rstrip()
-    titulo = PREFIXO_TITULO + nome_t + SUFIXO_TITULO
+def construir_titulo_run(n: int = 1, total: int = 1) -> str:
+    nome = NOME_TITULO_RUN if total == 1 else f"{NOME_TITULO_RUN} {n}"
+    titulo = PREFIXO_TITULO + nome + SUFIXO_TITULO
     if not 2 <= len(titulo) <= LIMITE_TITULO:
         raise ValueError(f"título inválido ({len(titulo)} car.): {titulo}")
     return titulo
 
 
-def construir_descricao(nome: str) -> str:
-    nome_t = limpar_nome_titulo(nome)
-    desc = DESCRICAO_MODELO.replace("@NOME@", nome_t)
+def construir_descricao(nomes: list[str]) -> str:
+    lista = "\n".join(f"- {limpar_nome_titulo(n)}" for n in nomes)
+    desc = DESCRICAO_MODELO.replace("@NOME@", lista)
     if not 10 <= len(desc) <= 5000:
         raise ValueError(f"descrição inválida ({len(desc)} car.)")
     return desc
@@ -194,25 +255,73 @@ def preco_shopee(k: float | None, l: float | None, r: int) -> float:
     if not candidatos:
         raise ValueError(f"linha {r}: K e L vazios - sem preço")
     p = Decimal(str(max(candidatos))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    p = Decimal(int(p)) + TERMINACAO_PRECO      # sempre ,90: 21,15 -> 21,90 | 19,86 -> 19,90
     if not Decimal("1.00") <= p <= Decimal("100000.00"):
         raise ValueError(f"linha {r}: preço {p} fora de 1.00..100000.00")
     return float(p)
 
 
-# --- FASE 2b: agrupamento por décadas de preço --------------------------------
-def rotulo_decada(decada: int) -> str:
-    return f"Peças {decada} a {decada + 9} Reais"
+def agrupar_por_razao(pecas: list[dict]) -> list[list[dict]]:
+    """Agrupa as peças em anúncios com preço mais caro <= RAZAO_PRECO_MAX x mais barato.
+    Guloso: cada anúncio começa na peça mais barata que ainda sobra; a peça que passa do limite abre o seguinte."""
+    limite = Decimal(str(RAZAO_PRECO_MAX))
+    grupos: list[list[dict]] = []
+    for p in sorted(pecas, key=lambda p: (p["preco"], p["nome"])):
+        preco = Decimal(str(p["preco"]))
+        if grupos and preco <= limite * Decimal(str(grupos[-1][0]["preco"])):
+            grupos[-1].append(p)
+        else:
+            grupos.append([p])
+    return grupos
 
 
-def construir_titulo_grupo(decada: int, lote: int, n_lotes: int) -> str:
-    meio = rotulo_decada(decada)
-    if n_lotes > 1:
-        meio += f" Lote {lote}"
-    max_nome = LIMITE_TITULO - len(PREFIXO_TITULO) - len(SUFIXO_TITULO)
-    meio = meio[:max_nome].rstrip()
-    titulo = PREFIXO_TITULO + meio + SUFIXO_TITULO
+def ler_taxas_config() -> dict:
+    """Lê da aba Config da calculadora as faixas de comissão da Shopee e o MEI/peça."""
+    wb = load_workbook(CALCULADORA, read_only=True, data_only=True)
+    ws = wb["Config"]
+
+    def b(linha: int) -> Decimal:
+        v = ws.cell(row=linha, column=2).value
+        if not isinstance(v, (int, float)):
+            raise ValueError(f"Config!B{linha} vazio ou não numérico ({v!r}) — guarde a calculadora no Excel")
+        return Decimal(str(v))
+
+    cfg = {
+        "mei": b(42),
+        # (limite superior, comissão %, taxa fixa); a última faixa não tem limite
+        "faixas": [(b(46), b(47), b(48)), (b(49), b(50), b(51)), (b(52), b(53), b(54)), (None, b(55), b(56))],
+    }
+    wb.close()
+    return cfg
+
+
+def preco_kit_bruto(soma: Decimal, cfg: dict) -> Decimal:
+    """Mesma lógica da coluna K: primeira faixa cujo preço calculado não ultrapassa o limite dela."""
+    for limite, comissao, fixa in cfg["faixas"]:
+        p = (soma + cfg["mei"] + fixa) / (1 - comissao / 100)
+        if limite is None or p <= limite:
+            return p
+    raise AssertionError("inalcançável: a última faixa não tem limite")
+
+
+def calcular_kit(precos_sem_taxas: list[float]) -> dict:
+    """Preço do kit com todas as peças numa só venda, pela tabela de faixas da aba Config:
+    soma os preços sem as taxas (coluna O), acrescenta MEI e taxa fixa da faixa e divide por
+    (1 - comissão da faixa). Arredonda como as peças: parte inteira + ,90."""
+    cfg = ler_taxas_config()
+    soma = sum(Decimal(str(p)) for p in precos_sem_taxas)
+    bruto = preco_kit_bruto(soma, cfg)
+    # parte inteira + ,90 nunca passa de um limite terminado em ,99, logo continua na faixa calculada
+    preco = Decimal(int(bruto.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))) + TERMINACAO_PRECO
+    if not Decimal("1.00") <= preco <= Decimal("100000.00"):
+        raise ValueError(f"preço do kit {preco} fora de 1.00..100000.00")
+    return {"soma": float(soma), "kit": float(preco)}
+
+
+def construir_titulo_kit(n: int) -> str:
+    titulo = PREFIXO_TITULO + f"Kit Completo {n} Miniaturas" + SUFIXO_TITULO
     if not 2 <= len(titulo) <= LIMITE_TITULO:
-        raise ValueError(f"título de grupo inválido ({len(titulo)} car.): {titulo}")
+        raise ValueError(f"título do kit inválido ({len(titulo)} car.): {titulo}")
     return titulo
 
 
@@ -225,7 +334,7 @@ def slug_sku(nome: str, prefixo: str = "MINI.") -> str:
 
 
 def opcao_variacao(nome: str, usadas: set[str]) -> str:
-    """G = nome da peça limpo, ≤30 chars, único dentro do grupo."""
+    """G = nome do modelo limpo, ≤30 chars, único dentro do anúncio."""
     g = limpar_nome_titulo(nome)[:LIMITE_G].rstrip()
     base, n = g, 2
     while g in usadas:
@@ -237,29 +346,8 @@ def opcao_variacao(nome: str, usadas: set[str]) -> str:
     return g
 
 
-def agrupar_por_decada(precos: dict[int, float]) -> list[dict]:
-    """Agrupa linhas por década de preço (int(p//10)*10), lotes de até GRUPO_MAX_VAR.
-
-    Devolve lista de grupos: {decada, lote, n_lotes, linhas: [row...]}
-    ordenados por preço crescente dentro de cada lote.
-    """
-    por_decada: dict[int, list[int]] = {}
-    for r, p in precos.items():
-        por_decada.setdefault(int(p // 10) * 10, []).append(r)
-
-    grupos: list[dict] = []
-    for decada in sorted(por_decada):
-        linhas_d = sorted(por_decada[decada], key=lambda r: precos[r])
-        lotes = [linhas_d[i:i + GRUPO_MAX_VAR] for i in range(0, len(linhas_d), GRUPO_MAX_VAR)]
-        for i, lote in enumerate(lotes, start=1):
-            grupos.append({
-                "decada": decada, "lote": i, "n_lotes": len(lotes), "linhas": lote,
-            })
-    return grupos
-
-
-# --- FASE 3: template + validação Gap 3 ---------------------------------------
-def carregar_template() -> tuple:
+# --- FASE 3: template + validação das listas ---------------------------------
+def carregar_template() -> Workbook:
     """Lê o ZIP do template, corrige activePane em memória e abre com openpyxl."""
     zin = zipfile.ZipFile(TEMPLATE)
     buf = io.BytesIO()
@@ -303,7 +391,7 @@ def resolver_formula1(wb, formula1: str) -> list[str] | None:
 
 
 def validar_contra_listas_da_planilha(ws, linha_final: int, linha_inicial: int = 7) -> list[str]:
-    """Confere valores das colunas com DV type='list' (Gap 3). Devolve problemas."""
+    """Confere valores das colunas com DV type='list'. Devolve problemas."""
     wb = ws.parent
     problemas: list[str] = []
     for dv in ws.data_validations.dataValidation:
@@ -316,6 +404,8 @@ def validar_contra_listas_da_planilha(ws, linha_final: int, linha_inicial: int =
         set_perm = set(permitidos)
         for token in str(dv.sqref).split():
             min_c, min_r, max_c, max_r = range_boundaries(token)
+            if min_c is None or min_r is None or max_c is None or max_r is None:
+                continue  # faixa sem limites (não acontece nas validações do template)
             for r in range(max(min_r, linha_inicial), min(max_r, linha_final) + 1):
                 for c in range(min_c, max_c + 1):
                     v = ws.cell(row=r, column=c).value
@@ -354,89 +444,110 @@ def contar_dv_xml(caminho: Path) -> tuple[int, int, int]:
     return total, nlist, nwhole
 
 
-# --- MAIN ---------------------------------------------------------------------
-def main() -> int:
-    print("=== FASE 1 - preços (Excel COM, read-only) ===")
+def caminho_saida_novo() -> Path:
+    """Ficheiro novo a cada run: Shopee_mass_upload_<data-hora>.xlsx (nunca sobrescreve)."""
+    base = f"Shopee_mass_upload_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+    caminho = PASTA_SAIDA / f"{base}.xlsx"
+    n = 2
+    while caminho.exists():
+        caminho = PASTA_SAIDA / f"{base}_{n}.xlsx"
+        n += 1
+    return caminho
+
+
+# --- PRINCIPAL ----------------------------------------------------------------
+def executar(caminho_csv: str | Path | None = None) -> int:
+    print("=== RUN - ler o CSV de resultados ===")
     try:
-        dados = obter_precos_com()
+        csv_path = resolver_csv(caminho_csv)
+        nomes, ignoradas = ler_run(csv_path)
+    except (FileNotFoundError, ValueError) as erro:
+        print(f"❌ {erro}")
+        return 1
+    print(f"📄 CSV: {csv_path} | peças válidas no run: {len(nomes)}")
+    for nome in ignoradas:
+        print(f"  ⚠️ {nome}: sem peso/tempo válidos — fora da planilha")
+    if not nomes:
+        print("❌ Nenhuma peça válida neste run.")
+        return 1
+
+    if ie.calculadora_aberta_no_excel(CALCULADORA):
+        print("❌ A calculadora está aberta no Excel. Guarde (Ctrl+S) e feche-a, e corra de novo.")
+        print(f"   (Se o Excel já estiver fechado, apague o ficheiro '~$...' na pasta: {CALCULADORA.parent})")
+        return 1
+
+    print("\n=== FASE 1 - localizar na calculadora e ler preços (Excel COM) ===")
+    encontrados, faltam = localizar_linhas(nomes)
+    for nome in faltam:
+        print(f"  ⚠️ '{nome}' não está na folha Pecas da calculadora — fora da planilha (correr importar_excel?)")
+    nomes_ok = [n for n in nomes if n in encontrados]
+    if not nomes_ok:
+        print("❌ Nenhuma peça do run foi encontrada na calculadora.")
+        return 1
+    try:
+        dados = obter_precos_com([encontrados[n] for n in nomes_ok])
     except Exception as erro:  # noqa: BLE001
         print(f"❌ {erro}")
         return 1
 
-    print("\n=== FASE 2 - montar linhas ===")
-    # Nomes direto da calculadora (openpyxl; só a coluna A, não toca no ficheiro)
-    wb_calc = load_workbook(CALCULADORA, read_only=True, data_only=True)
-    ws_calc = wb_calc[FOLHA_CALC]
-    nomes = {}
-    for row in ws_calc.iter_rows(min_row=LINHA_INI, max_row=LINHA_FIM, min_col=1, max_col=1):
-        nomes[row[0].row] = row[0].value
-    wb_calc.close()
-
+    print("\n=== FASE 2 - montar o anúncio único ===")
     pecas: list[dict] = []
     try:
-        for r in range(LINHA_INI, LINHA_FIM + 1):
-            nome, k, l = nomes.get(r), dados[r][0], dados[r][1]
-            if not nome:
-                raise ValueError(f"linha {r}: nome vazio na calculadora")
-            pecas.append({"row": r, "nome": nome, "preco": preco_shopee(k, l, r)})
+        for nome in nomes_ok:
+            r = encontrados[nome]
+            if dados[r][2] is None:
+                raise ValueError(f"linha {r} ({nome}): coluna O (Preço sem as taxas) vazia "
+                                 f"— guarde e feche a calculadora no Excel e corra de novo")
+            pecas.append({"row": r, "nome": nome, "preco": preco_shopee(dados[r][0], dados[r][1], r),
+                          "sem_taxas": dados[r][2]})
     except ValueError as erro:
         print(f"❌ {erro}")
         return 1
+    pecas.sort(key=lambda p: (p["preco"], p["nome"]))
 
-    precos = {p["row"]: p["preco"] for p in pecas}
-    print(f"  {len(pecas)} peças | preço min {min(precos.values()):.2f} "
-          f"| médio {sum(precos.values())/len(precos):.2f} | max {max(precos.values()):.2f}")
+    precos = [p["preco"] for p in pecas]
+    print(f"  {len(pecas)} variações | preço min {min(precos):.2f} "
+          f"| médio {sum(precos)/len(precos):.2f} | max {max(precos):.2f}")
+    grupos = agrupar_por_razao(pecas)
+    print(f"  {len(pecas)} variações -> {len(grupos)} anúncio(s) (razão preço <= {RAZAO_PRECO_MAX:.2f}x)")
+    for e, grupo in enumerate(grupos, start=1):
+        gp = [p["preco"] for p in grupo]
+        print(f"     E={e} | {len(grupo)} var. | {min(gp):.2f} a {max(gp):.2f} | razão {max(gp)/min(gp):.2f}")
+    if any(len(g) > MAX_VARIACOES for g in grupos):
+        print(f"  ⚠️ algum anúncio acima de {MAX_VARIACOES} variações (confirmar o limite da Shopee)")
 
-    # Agrupar em anúncios com variações (coluna E = chave de integração)
-    if AGRUPAR_E:
-        grupos = agrupar_por_decada(precos)
-        print(f"  Agrupamento por décadas: {len(grupos)} anúncios "
-              f"(máx {GRUPO_MAX_VAR} variações/grupo)")
-    else:
-        grupos = [{"decada": None, "lote": 1, "n_lotes": 1, "linhas": [p["row"] for p in pecas]}]
-
-    por_row = {p["row"]: p for p in pecas}
-    linhas: list[dict] = []          # uma entrada por LIGAÇA (linhas do template)
-    grupos_out: list[dict] = []      # metadados p/ validação da Fase 4
     try:
-        for e, g in enumerate(grupos, start=1):
-            decada, lote, n_lotes = g["decada"], g["lote"], g["n_lotes"]
-            if AGRUPAR_E:
-                rotulo = rotulo_decada(decada) + (f" Lote {lote}" if n_lotes > 1 else "")
-                titulo = construir_titulo_grupo(decada, lote, n_lotes)
-                descricao = construir_descricao(rotulo)
-                sku_principal = f"MINI.LOTE{decada}.{lote}"
-                e_valor = str(e)
-            else:
-                rotulo = None
-                titulo = descricao = sku_principal = e_valor = None
-
+        stamp = time.strftime("%Y%m%d%H%M%S")
+        linhas: list[dict] = []
+        usadas_m: set[str] = set()
+        for e, grupo in enumerate(grupos, start=1):
+            titulo = construir_titulo_run(e, len(grupos))
+            descricao = construir_descricao([p["nome"] for p in grupo])
+            sku_principal = f"MINI.RUN{stamp}.{e}"
             usadas_g: set[str] = set()
-            usadas_m: set[str] = set()
-            item_grupo = {"e": e_valor, "titulo": titulo, "descricao": descricao,
-                          "sku_principal": sku_principal, "linhas": []}
-            for r in g["linhas"]:
-                p = por_row[r]
-                if AGRUPAR_E:
-                    g_opcao = opcao_variacao(p["nome"], usadas_g)
-                    usadas_g.add(g_opcao)
-                    m_sku = slug_sku(p["nome"])
-                    if m_sku in usadas_m:            # unicidade de M dentro do grupo
-                        raise ValueError(f"linha {r}: SKU duplicado no grupo: {m_sku}")
-                    usadas_m.add(m_sku)
-                else:
-                    titulo = construir_titulo(p["nome"])
-                    descricao = construir_descricao(p["nome"])
-                    g_opcao = m_sku = None
-                item = {
-                    "row": r, "nome": p["nome"], "preco": p["preco"],
-                    "titulo": titulo, "descricao": descricao,
-                    "sku_principal": sku_principal,
-                    "e": e_valor, "g": g_opcao, "m": m_sku,
-                }
-                linhas.append(item)
-                item_grupo["linhas"].append(item)
-            grupos_out.append(item_grupo)
+            for p in grupo:
+                g_opcao = opcao_variacao(p["nome"], usadas_g)
+                usadas_g.add(g_opcao)
+                m_sku = slug_sku(p["nome"])
+                if m_sku in usadas_m:
+                    raise ValueError(f"SKU duplicado: {m_sku} ({p['nome']})")
+                usadas_m.add(m_sku)
+                linhas.append({
+                    "row": p["row"], "nome": p["nome"], "preco": p["preco"],
+                    "titulo": titulo, "descricao": descricao, "sku_principal": sku_principal,
+                    "e": str(e), "f": NOME_VAR, "g": g_opcao, "m": m_sku,
+                })
+        if len(pecas) >= 2:
+            kit = calcular_kit([p["sem_taxas"] for p in pecas])
+            soma_publicada = sum(p["preco"] for p in pecas)
+            print(f"  Kit completo ({len(pecas)} peças): soma sem taxas {kit['soma']:.2f} "
+                  f"| preço do kit {kit['kit']:.2f} | soma dos preços publicados {soma_publicada:.2f}")
+            linhas.append({
+                "row": None, "nome": "Kit Completo", "preco": kit["kit"],
+                "titulo": construir_titulo_kit(len(pecas)),
+                "descricao": construir_descricao([p["nome"] for p in pecas]),
+                "sku_principal": f"MINI.KIT{stamp}", "e": None, "f": None, "g": None, "m": None,
+            })
     except ValueError as erro:
         print(f"❌ {erro}")
         return 1
@@ -465,14 +576,13 @@ def main() -> int:
         c_gtin = ws.cell(row=r, column=COL["gtin"], value=GTIN_SEM)
         c_gtin.number_format = "@"               # P: texto ("00" não vira número)
         # AF (32) fica vazia - "Please do not edit this column"
-        if AGRUPAR_E:
-            ws.cell(row=r, column=COL["sku_principal"], value=item["sku_principal"])
-            ws.cell(row=r, column=COL["e_agrup"], value=item["e"])
-            ws.cell(row=r, column=COL["f_var"], value=NOME_VAR)
-            ws.cell(row=r, column=COL["g_opcao"], value=item["g"])
-            ws.cell(row=r, column=COL["m_sku"], value=item["m"])
-            ws.cell(row=r, column=COL["ag"], value=PRE_ENCOMENDA)
-            # H (8) e R..Z: fotos - ficam vazias (preenchimento manual)
+        ws.cell(row=r, column=COL["sku_principal"], value=item["sku_principal"])
+        ws.cell(row=r, column=COL["e_agrup"], value=item["e"])
+        ws.cell(row=r, column=COL["f_var"], value=item["f"])
+        ws.cell(row=r, column=COL["g_opcao"], value=item["g"])
+        ws.cell(row=r, column=COL["m_sku"], value=item["m"])
+        ws.cell(row=r, column=COL["ag"], value=PRE_ENCOMENDA)
+        # H (8) e R..Z: fotos - ficam vazias (preenchimento manual)
 
     linha_final = LINHA_DADOS_TEMPLATE + len(linhas) - 1
     problemas = validar_contra_listas_da_planilha(ws, linha_final=linha_final)
@@ -483,12 +593,14 @@ def main() -> int:
         return 1
     print(f"  Validação das listas: OK (linhas {LINHA_DADOS_TEMPLATE}..{linha_final})")
 
-    wb.save(SAIDA)
+    saida = caminho_saida_novo()
+    saida.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(saida)
     wb.close()
-    print(f"  Gravado: {SAIDA}")
+    print(f"  Gravado: {saida}")
 
     print("\n=== FASE 4 - validação pós-gravação ===")
-    contagem = contar_dv_xml(SAIDA)
+    contagem = contar_dv_xml(saida)
     esperado = (5005, 5004, 1)
     ok = True
     if contagem != esperado:
@@ -498,7 +610,7 @@ def main() -> int:
         print(f"  DVs no XML gravado: {contagem} (total/list/whole) ✔")
 
     wb_t = carregar_template()
-    wb_s = load_workbook(SAIDA)
+    wb_s = load_workbook(saida)
     s_t, s_s = dv_set(wb_t), dv_set(wb_s)
     diff = s_t ^ s_s
     if diff:
@@ -507,7 +619,7 @@ def main() -> int:
         for d in sorted(diff)[:20]:
             print("   ", d)
     else:
-        print(f"  DVs (sqref+formula1+type+allowBlank): diff = 0 ✔")
+        print("  DVs (sqref+formula1+type+allowBlank): diff = 0 ✔")
 
     ws_o, ws_f = wb_t[FOLHA_TEMPLATE], wb_s[FOLHA_TEMPLATE]
     alteradas = []
@@ -544,14 +656,11 @@ def main() -> int:
             COL["altura"]: ALTURA, COL["canal_ae"]: CANAL_AE,
             COL["agrupavel"]: ITEM_AGRUPAVEL, 32: None,
             COL["gtin"]: GTIN_SEM,
+            COL["sku_principal"]: item["sku_principal"], COL["e_agrup"]: item["e"],
+            COL["f_var"]: item["f"], COL["g_opcao"]: item["g"],
+            COL["m_sku"]: item["m"], COL["ag"]: PRE_ENCOMENDA,
+            34: None,                   # AH: sem NCM
         }
-        if AGRUPAR_E:
-            esperados.update({
-                COL["sku_principal"]: item["sku_principal"], COL["e_agrup"]: item["e"],
-                COL["f_var"]: NOME_VAR, COL["g_opcao"]: item["g"],
-                COL["m_sku"]: item["m"], COL["ag"]: PRE_ENCOMENDA,
-                34: None,                   # AH: sem NCM
-            })
         for c, esp in esperados.items():
             v = ws_f.cell(row=r, column=c).value
             if v != esp:
@@ -564,80 +673,69 @@ def main() -> int:
         for e in erros_valores[:20]:
             print("   ", e)
     else:
-        print(f"  Valores das {len(linhas)} linhas conferem ✔ "
+        print(f"  Valores das {len(linhas)} linhas (variações + kit) conferem ✔ "
               "(incl. AE=Ligado, AF=vazia, AV=No, P=00)")
 
-    # --- validação dos grupos (coluna E) -------------------------------------
-    if AGRUPAR_E:
-        erros_grupo = []
-        por_e: dict[str, list[dict]] = {}
-        for item in linhas:
-            por_e.setdefault(item["e"], []).append(item)
-        if len(por_e) != len(grupos_out):
-            erros_grupo.append(f"{len(por_e)} grupos distintos em E (esperado {len(grupos_out)})")
-        for e, itens in por_e.items():
-            if len(itens) > GRUPO_MAX_VAR:
-                erros_grupo.append(f"E={e}: {len(itens)} variações (máx {GRUPO_MAX_VAR})")
-            for campo in ("titulo", "descricao", "sku_principal"):
-                if len({it[campo] for it in itens}) != 1:
-                    erros_grupo.append(f"E={e}: {campo} divergente dentro do grupo")
-            gs = [it["g"] for it in itens]
-            ms = [it["m"] for it in itens]
-            if len(set(gs)) != len(gs):
-                erros_grupo.append(f"E={e}: opção G duplicada")
-            if len(set(ms)) != len(ms):
-                erros_grupo.append(f"E={e}: SKU M duplicado")
-            ps = [it["preco"] for it in itens]
-            razao = max(ps) / min(ps)
-            if razao > RAZAO_PRECO_MAX:
-                erros_grupo.append(f"E={e}: razão preço {razao:.2f} > {RAZAO_PRECO_MAX}")
-            # linhas do mesmo grupo contíguas no template?
-            idxs = [linhas.index(it) for it in itens]
-            if idxs != list(range(idxs[0], idxs[0] + len(idxs))):
-                erros_grupo.append(f"E={e}: linhas não contíguas no template")
-        if erros_grupo:
-            ok = False
-            print(f"  ❌ validação de grupos ({len(erros_grupo)}):")
-            for g in erros_grupo[:20]:
-                print("   ", g)
-        else:
-            print(f"  Grupos: {len(por_e)} anúncios, ≤{GRUPO_MAX_VAR} var., B/C/D iguais, "
-                  f"G/M únicos, razão preço ≤{RAZAO_PRECO_MAX} ✔")
+    # --- validação dos anúncios (razão 4x, G único por anúncio, M único, linhas contíguas) ---
+    erros_anuncio = []
+    por_e: dict[str, list[dict]] = {}
+    for it in linhas:
+        if it["e"] is not None:          # o kit (sem E) fica fora das regras por anúncio
+            por_e.setdefault(it["e"], []).append(it)
+    for e, its in por_e.items():
+        ps = [it["preco"] for it in its]
+        if max(ps) > RAZAO_PRECO_MAX * min(ps) + 1e-9:
+            erros_anuncio.append(f"anúncio {e}: razão {max(ps) / min(ps):.2f} > {RAZAO_PRECO_MAX:.2f}")
+        if len({it["g"] for it in its}) != len(its):
+            erros_anuncio.append(f"anúncio {e}: opção G duplicada")
+        idxs = [i for i, it in enumerate(linhas) if it["e"] == e]
+        if idxs != list(range(idxs[0], idxs[0] + len(idxs))):
+            erros_anuncio.append(f"anúncio {e}: linhas não contíguas no template")
+    com_m = [it["m"] for it in linhas if it["m"] is not None]
+    if len(set(com_m)) != len(com_m):
+        erros_anuncio.append("SKU M duplicado no ficheiro")
+    if erros_anuncio:
+        ok = False
+        print(f"  ❌ validação dos anúncios ({len(erros_anuncio)}):")
+        for g in erros_anuncio:
+            print("   ", g)
+    else:
+        print(f"  Anúncios: {len(por_e)} com razão <= {RAZAO_PRECO_MAX:.2f} ✔ (G/M únicos, linhas contíguas)")
 
-        # fotos: H (por variação) e R..Z (galeria) ficam vazias - aviso, não falha
-        cols_foto = [8] + list(range(18, 27))
-        fotos_pendentes = [
-            f"{get_column_letter(c)}{LINHA_DADOS_TEMPLATE + i}"
-            for i in range(len(linhas)) for c in cols_foto
-            if ws_f.cell(row=LINHA_DADOS_TEMPLATE + i, column=c).value in (None, "")
-        ]
-        if fotos_pendentes:
-            print(f"  ⚠ FOTOS PENDENTES: {len(fotos_pendentes)} células vazias "
-                  f"(H por variação + R..Z capa/galeria) - preencher manualmente antes do upload")
+    # fotos: H (por variação) e R..Z (galeria) ficam vazias - aviso, não falha
+    cols_foto = [8] + list(range(18, 27))
+    fotos_pendentes = [
+        f"{get_column_letter(c)}{LINHA_DADOS_TEMPLATE + i}"
+        for i in range(len(linhas)) for c in cols_foto
+        if ws_f.cell(row=LINHA_DADOS_TEMPLATE + i, column=c).value in (None, "")
+        and not (linhas[i]["e"] is None and c == 8)
+    ]
+    if fotos_pendentes:
+        print(f"  ⚠ FOTOS PENDENTES: {len(fotos_pendentes)} células vazias "
+              "(H por variação + R..Z capa/galeria) - preencher manualmente antes do upload")
 
     wb_t.close()
     wb_s.close()
 
-    print("\n=== AMOSTRA (linha template | preço | E | opção G | título) ===")
-    for i in list(range(3)) + list(range(len(linhas) - 2, len(linhas))):
+    print("\n=== AMOSTRA (linha template | preço | G | título) ===")
+    for i in list(range(min(3, len(linhas)))) + list(range(max(3, len(linhas) - 2), len(linhas))):
         item = linhas[i]
-        e = item["e"] or "-"
-        g = item["g"] or item["nome"]
-        print(f"  {LINHA_DADOS_TEMPLATE + i} | {item['preco']:.2f} | {e} | {g} | {item['titulo']}")
+        print(f"  {LINHA_DADOS_TEMPLATE + i} | {item['preco']:.2f} | {item['g']} | {item['titulo']}")
 
     print()
     if ok:
-        n_grupos = len(grupos_out) if AGRUPAR_E else len(linhas)
-        print(f"✅ TUDO OK - ficheiro pronto para upload: {SAIDA}")
-        print(f"   {len(linhas)} linhas = {n_grupos} anúncio(s) | linhas "
+        print(f"✅ TUDO OK - ficheiro pronto para upload: {saida}")
+        print(f"   {len([it for it in linhas if it['e'] is not None])} variações em {len({it["e"] for it in linhas if it["e"] is not None})} anúncio(s){" + kit" if any(it["e"] is None for it in linhas) else ""} | linhas "
               f"{LINHA_DADOS_TEMPLATE}..{linha_final} do template")
-        if AGRUPAR_E:
-            print("   Pendente manual: fotos (H + R..Z), corrigir títulos genéricos,")
-            print("   apagar os 47 anúncios antigos (GTIN já = 00; confirmar se o")
-            print("   checkbox 'Item sem GTIN' ainda é necessário no upload)")
+        print("   Pendente manual: fotos (H + R..Z), corrigir o título genérico")
+        print("   e confirmar o checkbox 'Item sem GTIN' no upload")
         return 0
     print("❌ FASE 4 FALHOU - rever erros acima")
     return 1
+
+
+def main() -> int:
+    return executar(sys.argv[1] if len(sys.argv) > 1 else None)
 
 
 if __name__ == "__main__":

@@ -44,7 +44,7 @@ Sem interface gráfica — tudo feito por código (`preencher_shopee.py`).
 | F | Nome da variação 1 | `Modelo` |
 | G | Opção da variação | Nome da peça (limpo, **≤30 chars**, único no grupo) |
 | H | Imagem por variação | **Manual** (fica vazio no script) |
-| K | Preço (R$) | Preço da peça (max(K,L) da calculadora), 2 casas |
+| K | Preço (R$) | `max(K,L)` da calculadora → parte inteira + **,90** (ex.: 21,15 → 21,90; 19,86 → 19,90) |
 | L | Estoque | `99999` |
 | M | SKU da variação | `MINI.`+slug do nome (≤100 chars, único no grupo) |
 | P | GTIN | `00` = item sem GTIN (texto, const `GTIN_SEM`); checkbox "Item sem GTIN" no upload **a confirmar** |
@@ -61,9 +61,14 @@ G/M ≤30/≤100 chars; **razão preço mais caro/mais barato dentro do anúncio
 
 ---
 
-## 3. Regras de agrupamento (coluna E) — DECIDIDO
+## 3. Regras de agrupamento (coluna E) — ATUALIZADO
 
-**Regra por valor de preço em décadas** (aprovada pelo utilizador):
+**Regra atual: anúncios por razão de preço.** As peças do run viram variações (cada modelo = uma variação, G = nome do
+modelo). Ordenadas por preço, são agrupadas gulosamente em anúncios (coluna E = 1, 2, …) de modo que o preço mais caro
+fique em no máximo 4× o mais barato dentro de cada anúncio. Não há décadas nem lotes de 10.
+A regra de décadas abaixo fica só como histórico da migração das 47 peças.
+
+**Regra antiga por décadas (histórico):**
 
 1. Preço final = `max(K, L)` arredondado a 2 casas (ROUND_HALF_UP)
 2. Grupo = mesma **década** de preço: `int(preço // 10) * 10` → 10–19,99 | 20–29,99 | 30–39,99 | ...
@@ -114,7 +119,7 @@ Razão de preço por grupo ≤ 1,44 (limite Shopee 4,00) ✔
 | Fotos H e R..Z | **Manuais** (script deixa vazio) |
 | GTIN | P=`00` (texto) escrito pelo script; checkbox "Item sem GTIN" no upload **a confirmar** no 1º upload |
 | Sob encomenda | **Sim, 3 dias** → AG=3 |
-| Preço | `max(K,L)`, 2 casas (min 17.15 / médio 27.35 / máx 127.11) |
+| Preço | `max(K,L)` → parte inteira + ,90 (preços sempre terminados em ,90) |
 | Peso/dims | 0.5 kg; caixa 6×16×8 cm |
 | Estoque | 99999 por variação |
 | Canais | AE=`Ligado`; AF vazia; fiscais AH–AT vazios |
@@ -130,17 +135,36 @@ Razão de preço por grupo ≤ 1,44 (limite Shopee 4,00) ✔
 
 ---
 
-## 5. Pipeline do script (`preencher_shopee.py`)
+## Anúncio kit (soma das peças)
 
-1. **Fase 1 — preços**: Excel COM read-only (`CalculateFullRebuild`), lê K/L das linhas 339–385; ficheiro fonte intacto
-2. **Fase 2 — montar linhas**: nomes via openpyxl (read-only); preço `max(K,L)`; agrupamento por décadas (novo); campos por grupo/linha (novo)
-3. **Fase 3 — gravar**: patch `activePane` em memória → openpyxl → validar valores contra DVs da planilha → salvar saída
+Quando o run tem 2 ou mais peças, o script acrescenta **uma linha final de produto simples** (sem E/F/G/M) com todas
+as peças juntas. Usa a coluna **O** da calculadora, "Preço sem as taxas" (valor de cada peça sem a taxa Shopee):
+
+- soma: `Σ O` das peças do run
+- kit: `(soma + 4,50) / 0,8`, arredondado como as peças (parte inteira + ,90)
+- os 4,50 e os 20 % entram uma vez, sobre o valor final do kit
+
+Exemplo: 3 peças com O = 20,00 → soma 60,00 → (60,00 + 4,50) / 0,8 = 80,625 → **80,90**.
+Se alguma peça do run tiver a coluna O vazia, o script para com erro e indica a linha.
+
+## 5. Pipeline (atual)
+
+0. **Robô (`automatizar_chitubox.py`)**: ao fim do run, `processar_capturas(capturas_run)` gera
+   `resultados/resultados_<data>.csv` só com as capturas deste run; depois `importar_excel.executar(csv)`
+   (insere na folha Pecas da calculadora, com backup) e `preencher_shopee.executar(csv)`.
+1. **Fase 1 — preços**: localiza as peças do CSV na coluna A da folha Pecas (última ocorrência) e lê K/L por
+   Excel COM (`CalculateFullRebuild`); ficheiro fonte intacto. Peças sem linha na calculadora ficam de fora (aviso).
+2. **Fase 2 — montar linhas**: agrupa as variações em anúncios (E = 1, 2, …) de forma gulosa, de modo que em cada anúncio
+   `max(preço) <= 4 × min(preço)`; preço `max(K,L)` por variação; G = nome do modelo limpo (sem sufixo `_32mm_…`).
+3. **Fase 3 — gravar**: patch `activePane` em memória → openpyxl → validar valores contra DVs → salvar em
+   **ficheiro novo** `shopee\Shopee_mass_upload_<data-hora>.xlsx` na pasta `shopee/` do projeto (nunca sobrescreve os anteriores).
 4. **Fase 4 — validar pós-gravação**:
    - DVs no XML = (5005, 5004, 1); diff DVs template vs saída = 0
    - Linhas 1–6 intactas
    - Revalidação das listas no ficheiro final
    - Valores esperados por coluna (**incl. P=GTIN `00`**, texto)
-   - **Novo**: mesmo E ⇒ mesmo B/C/D/F; ≤10 linhas por E; G≤30 único no grupo; M≤100 único; razão preço ≤4,00 por grupo; AG=3
+   - G≤30 e M≤100 únicos; AG=3; aviso se passar de `MAX_VARIACOES` (50)
+   - Razão 4× por anúncio, G único por anúncio, M único no ficheiro e linhas de cada anúncio contíguas — **erro** se falhar
    - **Aviso** (não falha) se H ou R..Z vazios → "fotos pendentes p/ preencher à mão"
 5. **Teste Excel COM**: abrir ficheiro gerado read-only e confirmar que não pede reparação
 
@@ -155,6 +179,9 @@ Razão de preço por grupo ≤ 1,44 (limite Shopee 4,00) ✔
       (Fases 1–4 OK; 9 anúncios × ≤10 var.; razão preço ≤4,0; Excel abriu sem reparação;
       470 células de foto vazias — pendente manual)
 - [x] GTIN: escrever `00` (texto) na coluna P das 47 linhas (const `GTIN_SEM`) — Fases 1–4 OK
+- [x] Anúncio único por run: planilha nova a cada run (`Shopee_mass_upload_<data-hora>.xlsx`), só com as peças do run;
+      cadeia automática no fim do robô (CSV → calculadora → planilha Shopee); regra 4× só aviso
+- [ ] **Teste**: correr uma pasta pequena com o robô e confirmar a planilha gerada e o Excel COM sem reparação
 - [ ] **Utilizador**: apagar os 47 anúncios individuais da Shopee
 - [ ] **Utilizador**: preencher fotos (H por variação; R..Z galeria) e corrigir títulos/descrições dos 9 grupos
 - [ ] **Utilizador**: subir em massa; confirmar se o checkbox "Item sem GTIN" ainda é necessário
